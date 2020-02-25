@@ -1,5 +1,5 @@
 [package]
-name = "bawidb"
+name = "bawikv"
 version = "0.0.1"
 authors = ["kwangin.jung <inylove82@gmail.com>"]
 edition = "2018"

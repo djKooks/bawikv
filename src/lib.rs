@@ -4,11 +4,12 @@ use std::fs::OpenOptions;
 use std::io::{Write, BufReader, BufRead, Error, ErrorKind};
 use std::path::Path;
 
-pub struct BawiDB {
+
+pub struct bawikv {
     pub file_path: String,
 }
 
-impl BawiDB {
+impl bawikv {
 
     pub fn put(&self, key: &str, value: &str) {
         let mut storage_file = match OpenOptions::new()
@@ -20,6 +21,11 @@ impl BawiDB {
                         Err(err) => panic!("Unknown error: {:?}", err),
                         Ok(f) => f
                     };
+
+
+        let mut bawi_map = HashMap::new();
+        bawi_map.insert(key, value);
+
         write!(storage_file, "{}::{}\n", key, value);
     }
 
