@@ -1,7 +1,9 @@
 # BawiKV
 Key-value store based on log-structure.
 
-__This project is for personal research. Any comment, guide or suggestion are welcome!__
+This project is for personal research, motivated by [build-your-own-x](https://github.com/danistefanovic/build-your-own-x) project.
+
+ Any comment, guide or suggestion are welcome!
 
 
 ## Reference

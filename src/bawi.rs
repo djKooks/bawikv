@@ -1,63 +1,225 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Error, ErrorKind, Write};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Deserializer;
+
+use crate::{InternalError, Result};
+
+struct BufReaderWithPos<R: Read + Seek> {
+    reader: BufReader<R>,
+    pos: u64,
+}
+
+impl<R: Read + Seek> BufReaderWithPos<R> {
+    fn new(mut inner: R) -> io::Result<Self> {
+        let pos = inner.seek(SeekFrom::Current(0)).unwrap();
+        Ok(BufReaderWithPos {
+            reader: BufReader::new(inner),
+            pos,
+        })
+    }
+}
+
+impl<R: Read + Seek> Read for BufReaderWithPos<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = self.reader.read(buf)?;
+        self.pos += len as u64;
+        Ok(len)
+    }
+}
+
+impl<R: Read + Seek> Seek for BufReaderWithPos<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.pos = self.reader.seek(pos)?;
+        Ok(self.pos)
+    }
+}
+
+struct BufWriterWithPos<W: Write + Seek> {
+    writer: BufWriter<W>,
+    pos: u64,
+}
+
+impl<W: Write + Seek> BufWriterWithPos<W> {
+    fn new(mut inner: W) -> Result<Self> {
+        let pos = inner.seek(SeekFrom::Current(0))?;
+        Ok(BufWriterWithPos {
+            writer: BufWriter::new(inner),
+            pos,
+        })
+    }
+}
+
+impl<W: Write + Seek> Write for BufWriterWithPos<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let len = self.writer.write(buf)?;
+        self.pos += len as u64;
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<W: Write + Seek> Seek for BufWriterWithPos<W> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.pos = self.writer.seek(pos)?;
+        Ok(self.pos)
+    }
+}
+
+struct CommandPos {
+    gen: u64,
+    pos: u64,
+    len: u64,
+}
+
+impl From<(u64, Range<u64>)> for CommandPos {
+    fn from((gen, range): (u64, Range<u64>)) -> Self {
+        CommandPos {
+            gen,
+            pos: range.start,
+            len: range.end - range.start,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum Command {
+    Set { key: String, value: String },
+    Remove { key: String },
+}
+
+impl Command {
+    fn set(key: String, value: String) -> Command {
+        Command::Set { key, value }
+    }
+
+    fn remove(key: String) -> Command {
+        Command::Remove { key }
+    }
+}
 
 pub struct BawiKv {
-    pub file_path: String,
+    path: PathBuf,
+    readers: HashMap<u64, BufReaderWithPos<File>>,
+    writer: BufWriterWithPos<File>,
+    current_gen: u64,
+    index: BTreeMap<String, CommandPos>,
+    uncompacted: u64,
 }
 
 impl BawiKv {
-    pub fn put(&self, key: &str, value: &str) {
-        let mut storage_file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(Path::new(&self.file_path))
-        {
-            Err(err) => panic!("Unknown error: {:?}", err),
-            Ok(f) => f,
-        };
+    pub fn open(path: impl Into<PathBuf>) -> Result<BawiKv> {
+        let path = path.into();
+        fs::create_dir_all(&path)?;
 
-        let mut bawi_map = HashMap::new();
-        bawi_map.insert(key, value);
+        let mut readers = HashMap::new();
+        let mut index = BTreeMap::new();
 
-        write!(storage_file, "{}::{}\n", key, value);
-    }
+        let gen_list = sorted_gen_list(&path).unwrap();
+        let mut uncompacted = 0;
+        println!("{:?}", gen_list);
 
-    pub fn get(&self, key: &str) -> Result<String, Error> {
-        let storage_file = match OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(Path::new(&self.file_path))
-        {
-            Err(err) => panic!("Unknown error: {:?}", err),
-            Ok(f) => f,
-        };
-
-        let reader = BufReader::new(storage_file);
-
-        for line in reader.lines() {
-            let txt = match line {
-                Err(err) => panic!("Unknown error: {:?}", err),
-                Ok(line) => line,
-            };
-
-            let splited: Vec<&str> = txt.split("::").collect();
-            if splited.len() == 2 {
-                if splited[0] == key {
-                    return Ok(String::from(splited[1]));
-                }
-            }
+        for &gen in &gen_list {
+            let mut reader = BufReaderWithPos::new(File::open(log_path(&path, gen))?)?;
+            uncompacted += load_log(gen, &mut reader, &mut index)?;
+            readers.insert(gen, reader);
         }
 
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("Invalid data: {}", key),
-        ));
+        let current_gen = gen_list.last().unwrap_or(&0) + 1;
+        let writer = new_log_file(&path, current_gen, &mut readers)?;
+
+        Ok(BawiKv {
+            path,
+            readers,
+            writer,
+            current_gen,
+            index,
+            uncompacted,
+        })
     }
 
-    fn search() {}
+    pub fn put(&self, key: &str, value: &str) {}
+
+    pub fn get(&self, key: &str) {}
+
+    fn new_log_file(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
+        new_log_file(&self.path, gen, &mut self.readers)
+    }
+}
+
+fn new_log_file(
+    path: &Path,
+    gen: u64,
+    readers: &mut HashMap<u64, BufReaderWithPos<File>>,
+) -> Result<BufWriterWithPos<File>> {
+    let path = log_path(&path, gen);
+    let writer = BufWriterWithPos::new(
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&path)?,
+    )?;
+
+    Ok(writer)
+}
+
+fn load_log(
+    gen: u64,
+    reader: &mut BufReaderWithPos<File>,
+    index: &mut BTreeMap<String, CommandPos>,
+) -> Result<u64> {
+    let mut position = reader.seek(SeekFrom::Start(0))?;
+    let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
+    let mut uncompacted = 0;
+
+    while let Some(cmd) = stream.next() {
+        let new_pos = stream.byte_offset() as u64;
+        match cmd? {
+            Command::Set { key, .. } => {
+                if let Some(old_cmd) = index.insert(key, (gen, position..new_pos).into()) {
+                    uncompacted += old_cmd.len;
+                }
+            }
+            Command::Remove { key } => {
+                if let Some(old_cmd) = index.remove(&key) {
+                    uncompacted += old_cmd.len;
+                }
+                // the "remove" command itself can be deleted in the next compaction.
+                // so we add its length to `uncompacted`.
+                uncompacted += new_pos - position;
+            }
+        }
+        position = new_pos;
+    }
+
+    Ok(uncompacted)
+}
+
+fn log_path(dir: &Path, gen: u64) -> PathBuf {
+    dir.join(format!("{}.log", gen))
+}
+
+fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
+    let mut gen_list: Vec<u64> = fs::read_dir(&path)?
+        .flat_map(|res| -> Result<_> { Ok(res?.path()) })
+        .filter(|path| path.is_file() && path.extension() == Some("log".as_ref()))
+        .flat_map(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .map(|s| s.trim_end_matches(".log"))
+                .map(str::parse::<u64>)
+        })
+        .flatten()
+        .collect();
+    gen_list.sort_unstable();
+    Ok(gen_list)
 }
