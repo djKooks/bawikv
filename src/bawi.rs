@@ -125,7 +125,7 @@ impl BawiKv {
 
         let gen_list = sorted_gen_list(&path).unwrap();
         let mut uncompacted = 0;
-        println!("{:?}", gen_list);
+        // println!("{:?}", gen_list);
 
         for &gen in &gen_list {
             let mut reader = BufReaderWithPos::new(File::open(log_path(&path, gen))?)?;
@@ -146,13 +146,51 @@ impl BawiKv {
         })
     }
 
-    pub fn put(&self, key: &str, value: &str) {}
+    pub fn put(&mut self, key: String, value: String) -> Result<()> {
+        let cmd = Command::set(key, value);
+        let pos = self.writer.pos;
+        serde_json::to_writer(&mut self.writer, &cmd)?;
 
-    pub fn get(&self, key: &str) {}
+        self.writer.flush()?;
+        if let Command::Set { key, .. } = cmd {
+            if let Some(old_cmd) = self
+                .index
+                .insert(key, (self.current_gen, pos..self.writer.pos).into())
+            {
+                self.uncompacted += old_cmd.len
+            }
+        }
 
-    fn new_log_file(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
-        new_log_file(&self.path, gen, &mut self.readers)
+        println!("uncompact: {:?}", self.uncompacted);
+
+        Ok(())
     }
+
+    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+        println!("command get");
+        if let Some(cmd_pos) = self.index.get(&key) {
+            println!("command get exists: {:?}", &cmd_pos.gen);
+            let reader = self
+                .readers
+                .get_mut(&cmd_pos.gen)
+                .expect("cannot find reader");
+            reader.seek(SeekFrom::Start(cmd_pos.pos))?;
+            let cmd_reader = reader.take(cmd_pos.len);
+            if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
+                println!("value => {:?}", value);
+                Ok(Some(value))
+            } else {
+                Err(InternalError::Unexpected)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+    /*
+        fn new_log_file(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
+            new_log_file(&self.path, gen, &mut self.readers)
+        }
+    */
 }
 
 fn new_log_file(
@@ -169,6 +207,7 @@ fn new_log_file(
             .open(&path)?,
     )?;
 
+    readers.insert(gen, BufReaderWithPos::new(File::open(&path)?)?);
     Ok(writer)
 }
 

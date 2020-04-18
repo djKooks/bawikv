@@ -2,4 +2,4 @@
 **/*.rs.bk
 Cargo.lock
 
-test.db
+test_db
