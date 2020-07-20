@@ -10,6 +10,8 @@ use serde_json::Deserializer;
 
 use crate::{InternalError, Result};
 
+const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
+
 struct BufReaderWithPos<R: Read + Seek> {
     reader: BufReader<R>,
     pos: u64,
@@ -40,6 +42,7 @@ impl<R: Read + Seek> Seek for BufReaderWithPos<R> {
     }
 }
 
+#[derive(Debug)]
 struct BufWriterWithPos<W: Write + Seek> {
     writer: BufWriter<W>,
     pos: u64,
@@ -74,6 +77,7 @@ impl<W: Write + Seek> Seek for BufWriterWithPos<W> {
     }
 }
 
+#[derive(Debug)]
 struct CommandPos {
     gen: u64,
     pos: u64,
@@ -111,7 +115,7 @@ pub struct BawiKv {
     readers: HashMap<u64, BufReaderWithPos<File>>,
     writer: BufWriterWithPos<File>,
     current_gen: u64,
-    index: BTreeMap<String, CommandPos>,
+    index_map: BTreeMap<String, CommandPos>,
     uncompacted: u64,
 }
 
@@ -121,19 +125,18 @@ impl BawiKv {
         fs::create_dir_all(&path)?;
 
         let mut readers = HashMap::new();
-        let mut index = BTreeMap::new();
+        let mut index_map = BTreeMap::new();
 
-        let gen_list = sorted_gen_list(&path).unwrap();
+        let logs_list = sorted_logs_list(&path).unwrap();
         let mut uncompacted = 0;
-        // println!("{:?}", gen_list);
 
-        for &gen in &gen_list {
-            let mut reader = BufReaderWithPos::new(File::open(log_path(&path, gen))?)?;
-            uncompacted += load_log(gen, &mut reader, &mut index)?;
-            readers.insert(gen, reader);
+        for &log in &logs_list {
+            let mut reader = BufReaderWithPos::new(File::open(log_path(&path, log))?)?;
+            uncompacted += load_log_index(log, &mut reader, &mut index_map)?;
+            readers.insert(log, reader);
         }
 
-        let current_gen = gen_list.last().unwrap_or(&0) + 1;
+        let current_gen = logs_list.last().unwrap_or(&0) + 1;
         let writer = new_log_file(&path, current_gen, &mut readers)?;
 
         Ok(BawiKv {
@@ -141,39 +144,41 @@ impl BawiKv {
             readers,
             writer,
             current_gen,
-            index,
+            index_map,
             uncompacted,
         })
     }
 
     pub fn put(&mut self, key: String, value: String) -> Result<()> {
         let cmd = Command::set(key, value);
+        println!("self.writer: {:?}", cmd);
         let pos = self.writer.pos;
         serde_json::to_writer(&mut self.writer, &cmd)?;
 
         self.writer.flush()?;
         if let Command::Set { key, .. } = cmd {
             if let Some(old_cmd) = self
-                .index
+                .index_map
                 .insert(key, (self.current_gen, pos..self.writer.pos).into())
             {
                 self.uncompacted += old_cmd.len
             }
         }
-
         println!("uncompact: {:?}", self.uncompacted);
-
+        if self.uncompacted > COMPACTION_THRESHOLD {
+            // TODO: compact storage
+            // self.compact()?;
+        }
         Ok(())
     }
 
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        println!("command get");
-        if let Some(cmd_pos) = self.index.get(&key) {
-            println!("command get exists: {:?}", &cmd_pos.gen);
+        if let Some(cmd_pos) = self.index_map.get(&key) {
             let reader = self
                 .readers
                 .get_mut(&cmd_pos.gen)
                 .expect("cannot find reader");
+
             reader.seek(SeekFrom::Start(cmd_pos.pos))?;
             let cmd_reader = reader.take(cmd_pos.len);
             if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
@@ -186,10 +191,17 @@ impl BawiKv {
             Ok(None)
         }
     }
+
     /*
-        fn new_log_file(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
-            new_log_file(&self.path, gen, &mut self.readers)
-        }
+    fn reduce_log(&mut self) -> Result<()> {
+        let reduce_index = self.current_gen + 1;
+        self.current_gen += 2;
+        self.writer = self.new_log_file(self.current_gen)?;
+
+    }
+    fn new_log_file(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
+        new_log_file(&self.path, gen, &mut self.readers)
+    }
     */
 }
 
@@ -211,7 +223,7 @@ fn new_log_file(
     Ok(writer)
 }
 
-fn load_log(
+fn load_log_index(
     gen: u64,
     reader: &mut BufReaderWithPos<File>,
     index: &mut BTreeMap<String, CommandPos>,
@@ -232,8 +244,7 @@ fn load_log(
                 if let Some(old_cmd) = index.remove(&key) {
                     uncompacted += old_cmd.len;
                 }
-                // the "remove" command itself can be deleted in the next compaction.
-                // so we add its length to `uncompacted`.
+
                 uncompacted += new_pos - position;
             }
         }
@@ -247,9 +258,12 @@ fn log_path(dir: &Path, gen: u64) -> PathBuf {
     dir.join(format!("{}.log", gen))
 }
 
-fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
+fn sorted_logs_list(path: &Path) -> Result<Vec<u64>> {
     let mut gen_list: Vec<u64> = fs::read_dir(&path)?
-        .flat_map(|res| -> Result<_> { Ok(res?.path()) })
+        .flat_map(|res| -> Result<_> {
+            println!("{:?}", res);
+            Ok(res?.path())
+        })
         .filter(|path| path.is_file() && path.extension() == Some("log".as_ref()))
         .flat_map(|path| {
             path.file_name()
